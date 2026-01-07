@@ -1,8 +1,9 @@
 import { useState, useEffect } from 'react'
 import type { FileEntry } from '../../preload/index.d'
+import SSHConnection from './SSHConnection'
 
 interface SidebarProps {
-  onFileSelect: (filePath: string) => void
+  onFileSelect: (filePath: string, isSSH?: boolean, connectionId?: string) => void
   selectedFile: string | null
 }
 
@@ -11,10 +12,16 @@ function Sidebar({ onFileSelect, selectedFile }: SidebarProps): React.JSX.Elemen
   const [files, setFiles] = useState<FileEntry[]>([])
   const [loading, setLoading] = useState(false)
   const [apiAvailable, setApiAvailable] = useState(false)
+  const [sshConnectionId, setSshConnectionId] = useState<string | null>(null)
+  const [isSSHMode, setIsSSHMode] = useState(false)
 
   useEffect(() => {
     // Check if API is available
-    if (window.api && window.api.openDirectory) {
+    if (
+      typeof window !== 'undefined' &&
+      window.api &&
+      typeof window.api.openDirectory === 'function'
+    ) {
       setApiAvailable(true)
     } else {
       console.warn('window.api is not available. Make sure preload script is loaded.')
@@ -34,7 +41,7 @@ function Sidebar({ onFileSelect, selectedFile }: SidebarProps): React.JSX.Elemen
       const dirPath = await window.api.openDirectory()
       if (dirPath) {
         setDirectory(dirPath)
-        await loadFiles(dirPath)
+        await loadFiles(dirPath, false, null)
       }
     } catch (error) {
       console.error('Error opening directory:', error)
@@ -44,18 +51,51 @@ function Sidebar({ onFileSelect, selectedFile }: SidebarProps): React.JSX.Elemen
     }
   }
 
-  const loadFiles = async (dirPath: string): Promise<void> => {
+  const loadFiles = async (
+    dirPath: string,
+    useSSH: boolean = false,
+    connectionId: string | null = null
+  ): Promise<void> => {
     try {
-      const fileList = await window.api.readDirectory(dirPath)
-      setFiles(fileList)
+      if (useSSH && connectionId) {
+        const fileList = await window.api.sshReadDirectory(connectionId, dirPath)
+        setFiles(fileList)
+      } else {
+        const fileList = await window.api.readDirectory(dirPath)
+        setFiles(fileList)
+      }
     } catch (error) {
       console.error('Error loading files:', error)
+      alert(`Error loading files: ${error instanceof Error ? error.message : String(error)}`)
     }
   }
 
+  const handleSSHConnect = async (connectionId: string, remotePath: string): Promise<void> => {
+    setSshConnectionId(connectionId)
+    setDirectory(`ssh://${connectionId}${remotePath}`)
+    setIsSSHMode(true)
+    // Используем параметры напрямую, так как setState асинхронный
+    await loadFiles(remotePath, true, connectionId)
+  }
+
+  const handleSSHDisconnect = (): void => {
+    setSshConnectionId(null)
+    setDirectory(null)
+    setIsSSHMode(false)
+    setFiles([])
+  }
+
   const handleFileClick = (file: FileEntry): void => {
-    if (!file.isDirectory) {
-      onFileSelect(file.path)
+    if (file.isDirectory) {
+      setDirectory(file.path)
+      // Используем текущее состояние для определения режима
+      loadFiles(file.path, isSSHMode, sshConnectionId)
+    } else {
+      if (isSSHMode && sshConnectionId) {
+        onFileSelect(file.path, true, sshConnectionId)
+      } else {
+        onFileSelect(file.path, false)
+      }
     }
   }
 
@@ -69,19 +109,30 @@ function Sidebar({ onFileSelect, selectedFile }: SidebarProps): React.JSX.Elemen
     <div className="sidebar">
       <div className="sidebar-header">
         <h2>Files</h2>
-        <button 
-          onClick={handleOpenDirectory} 
-          disabled={loading || !apiAvailable} 
-          className="open-dir-btn"
-          title={!apiAvailable ? 'API not available' : ''}
-        >
-          {loading ? 'Loading...' : 'Open Folder'}
-        </button>
+        <SSHConnection
+          onConnect={handleSSHConnect}
+          onDisconnect={handleSSHDisconnect}
+          isConnected={isSSHMode}
+          connectionId={sshConnectionId}
+        />
+        {!isSSHMode && (
+          <button
+            onClick={handleOpenDirectory}
+            disabled={loading || !apiAvailable}
+            className="open-dir-btn"
+            title={!apiAvailable ? 'API not available' : ''}
+          >
+            {loading ? 'Loading...' : 'Open Folder'}
+          </button>
+        )}
       </div>
       <div className="sidebar-content">
         {directory ? (
           <div className="file-list">
-            <div className="directory-path">{directory}</div>
+            <div className="directory-path">
+              {isSSHMode ? '🔐 ' : ''}
+              {directory}
+            </div>
             {files.length === 0 ? (
               <div className="empty-state">No files found</div>
             ) : (
@@ -96,7 +147,9 @@ function Sidebar({ onFileSelect, selectedFile }: SidebarProps): React.JSX.Elemen
                 >
                   <span className="file-icon">{file.isDirectory ? '📁' : '📄'}</span>
                   <span className="file-name">{file.name}</span>
-                  {!file.isDirectory && <span className="file-size">{formatFileSize(file.size)}</span>}
+                  {!file.isDirectory && (
+                    <span className="file-size">{formatFileSize(file.size)}</span>
+                  )}
                 </div>
               ))
             )}
@@ -104,7 +157,9 @@ function Sidebar({ onFileSelect, selectedFile }: SidebarProps): React.JSX.Elemen
         ) : (
           <div className="empty-state">
             <p>No folder opened</p>
-            <p className="hint">Click "Open Folder" to select a directory</p>
+            <p className="hint">
+              Click &quot;Open Folder&quot; or &quot;Connect via SSH&quot; to get started
+            </p>
           </div>
         )}
       </div>
@@ -113,4 +168,3 @@ function Sidebar({ onFileSelect, selectedFile }: SidebarProps): React.JSX.Elemen
 }
 
 export default Sidebar
-

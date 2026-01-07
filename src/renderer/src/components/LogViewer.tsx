@@ -3,12 +3,21 @@ import type { FileContent } from '../../preload/index.d'
 
 interface LogViewerProps {
   filePath: string | null
+  isSSH?: boolean
+  sshConnectionId?: string
 }
 
 const LINES_PER_LOAD = 500
 const SCROLL_THRESHOLD = 200 // pixels from bottom to trigger load
 
-function LogViewer({ filePath }: LogViewerProps): React.JSX.Element {
+const formatBytes = (bytes: number): string => {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`
+}
+
+function LogViewer({ filePath, isSSH = false, sshConnectionId }: LogViewerProps): React.JSX.Element {
   const [allLines, setAllLines] = useState<string[]>([])
   const [totalLines, setTotalLines] = useState<number>(0)
   const [loading, setLoading] = useState(false)
@@ -16,6 +25,7 @@ function LogViewer({ filePath }: LogViewerProps): React.JSX.Element {
   const [error, setError] = useState<string | null>(null)
   const [currentOffset, setCurrentOffset] = useState(0)
   const [hasMore, setHasMore] = useState(true)
+  const [loadProgress, setLoadProgress] = useState<{ bytesRead: number; totalBytes: number; progress: number } | null>(null)
   const scrollContainerRef = useRef<HTMLDivElement>(null)
   const loadingRef = useRef(false)
 
@@ -28,8 +38,39 @@ function LogViewer({ filePath }: LogViewerProps): React.JSX.Element {
       setError(null)
       setCurrentOffset(0)
       setHasMore(true)
+      setLoadProgress(null)
     }
   }, [filePath])
+
+  // Подписываемся на события прогресса для SSH файлов
+  useEffect(() => {
+    if (!isSSH || !window.api?.onSSHReadFileProgress) return
+
+    const handleProgress = (progress: {
+      connectionId: string
+      remotePath: string
+      bytesRead: number
+      totalBytes: number
+      progress: number
+    }) => {
+      // Обновляем прогресс только если это текущий файл
+      if (filePath && progress.remotePath === filePath) {
+        setLoadProgress({
+          bytesRead: progress.bytesRead,
+          totalBytes: progress.totalBytes,
+          progress: progress.progress
+        })
+      }
+    }
+
+    window.api.onSSHReadFileProgress(handleProgress)
+
+    return () => {
+      if (window.api?.offSSHReadFileProgress) {
+        window.api.offSSHReadFileProgress()
+      }
+    }
+  }, [isSSH, filePath])
 
   const resetAndLoad = async (path: string): Promise<void> => {
     setLoading(true)
@@ -37,33 +78,34 @@ function LogViewer({ filePath }: LogViewerProps): React.JSX.Element {
     setAllLines([])
     setCurrentOffset(0)
     setHasMore(true)
+    setLoadProgress(null)
     loadingRef.current = false
 
     try {
-      // Get total line count first (if available)
-      if (window.api && typeof window.api.getLineCount === 'function') {
-        try {
-          const lineCount = await window.api.getLineCount(path)
-          setTotalLines(lineCount)
-        } catch (err) {
-          console.warn('Failed to get line count, continuing without it:', err)
-          setTotalLines(0) // Will be updated as we load
-        }
-      } else {
-        console.warn('getLineCount is not available. Available methods:', Object.keys(window.api || {}))
-        setTotalLines(0) // Will be updated as we load
-      }
+      // Для больших файлов не считаем общее количество строк сразу - это может занять много времени
+      // Будем обновлять по мере загрузки
+      setTotalLines(0)
 
-      // Load initial chunk
-      const fileContent = await window.api.readFile(path, 0, LINES_PER_LOAD)
+      // Load initial chunk асинхронно
+      let fileContent: FileContent
+      if (isSSH && sshConnectionId && window.api && typeof window.api.sshReadFile === 'function') {
+        fileContent = await window.api.sshReadFile(sshConnectionId, path, 0, LINES_PER_LOAD)
+      } else {
+        fileContent = await window.api.readFile(path, 0, LINES_PER_LOAD)
+      }
+      
       setAllLines(fileContent.lines)
       setCurrentOffset(LINES_PER_LOAD)
       setHasMore(fileContent.hasMore)
       
-      // Update total lines if we got it from readFile
+      // Обновляем общее количество строк из результата чтения
+      // Это приблизительное значение, но достаточно для отображения
       if (fileContent.totalLines > 0) {
         setTotalLines(fileContent.totalLines)
       }
+
+      // Для больших файлов не пытаемся считать точное количество строк в фоне
+      // Это может занять слишком много времени и ресурсов
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to read file')
       setAllLines([])
@@ -79,7 +121,13 @@ function LogViewer({ filePath }: LogViewerProps): React.JSX.Element {
     setLoadingMore(true)
 
     try {
-      const fileContent = await window.api.readFile(filePath, currentOffset, LINES_PER_LOAD)
+      let fileContent: FileContent
+      if (isSSH && sshConnectionId && window.api && typeof window.api.sshReadFile === 'function') {
+        fileContent = await window.api.sshReadFile(sshConnectionId, filePath, currentOffset, LINES_PER_LOAD)
+      } else {
+        fileContent = await window.api.readFile(filePath, currentOffset, LINES_PER_LOAD)
+      }
+      
       setAllLines((prev) => [...prev, ...fileContent.lines])
       setCurrentOffset((prev) => prev + fileContent.lines.length)
       setHasMore(fileContent.hasMore)
@@ -90,7 +138,7 @@ function LogViewer({ filePath }: LogViewerProps): React.JSX.Element {
       setLoadingMore(false)
       loadingRef.current = false
     }
-  }, [filePath, currentOffset, hasMore])
+  }, [filePath, currentOffset, hasMore, isSSH, sshConnectionId])
 
   const handleScroll = useCallback(() => {
     const container = scrollContainerRef.current
@@ -126,14 +174,48 @@ function LogViewer({ filePath }: LogViewerProps): React.JSX.Element {
   }
 
   if (loading) {
+    const fileName = filePath.split(/[/\\]/).pop()
     return (
       <div className="log-viewer">
         <div className="log-viewer-header">
           <div className="file-info">
-            <span className="file-name">{filePath.split(/[/\\]/).pop()}</span>
+            <span className="file-name">{fileName}</span>
+            {isSSH && <span className="file-source-badge">SSH</span>}
           </div>
         </div>
-        <div className="log-viewer-loading">Loading file...</div>
+        <div className="log-viewer-loading">
+          <div className="loading-content">
+            <div className="loading-spinner"></div>
+            <p className="loading-text">
+              {isSSH ? 'Connecting to server and reading file...' : 'Loading file...'}
+            </p>
+            <p className="loading-hint">
+              {isSSH
+                ? 'This may take a moment for large files'
+                : 'Please wait'}
+            </p>
+            {loadProgress && loadProgress.totalBytes > 0 ? (
+              <div className="progress-container">
+                <div className="progress-info">
+                  <span>
+                    {formatBytes(loadProgress.bytesRead)} / {formatBytes(loadProgress.totalBytes)}
+                  </span>
+                  <span>{loadProgress.progress}%</span>
+                </div>
+                <div className="progress-bar-container">
+                  <div
+                    className="progress-bar-fill"
+                    style={{ width: `${loadProgress.progress}%` }}
+                  ></div>
+                </div>
+              </div>
+            ) : (
+              <div className="progress-bar-container">
+                <div className="progress-bar"></div>
+              </div>
+            )}
+          </div>
+        </div>
       </div>
     )
   }

@@ -5,6 +5,7 @@ import { readdir, stat } from 'fs/promises'
 import { createInterface } from 'readline'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
+import { sshManager, type SSHConnectionConfig } from './ssh-manager'
 
 function createWindow(): void {
   // Create the browser window.
@@ -68,7 +69,7 @@ app.whenReady().then(() => {
   ipcMain.handle('fs:readDirectory', async (_, dirPath: string) => {
     try {
       const entries = await readdir(dirPath, { withFileTypes: true })
-      const files = []
+      const files: Array<{ name: string; path: string; isDirectory: boolean; size: number }> = []
       for (const entry of entries) {
         const fullPath = join(dirPath, entry.name)
         const stats = await stat(fullPath)
@@ -194,6 +195,101 @@ app.whenReady().then(() => {
       console.error('Error getting file stats:', error)
       throw error
     }
+  })
+
+  // SSH IPC handlers
+  ipcMain.handle('ssh:connect', async (_, config: SSHConnectionConfig) => {
+    try {
+      const connectionId = await sshManager.connect(config)
+      return { success: true, connectionId }
+    } catch (error) {
+      console.error('SSH connection error:', error)
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : String(error)
+      }
+    }
+  })
+
+  ipcMain.handle('ssh:disconnect', async (_, connectionId: string) => {
+    try {
+      await sshManager.disconnect(connectionId)
+      return { success: true }
+    } catch (error) {
+      console.error('SSH disconnect error:', error)
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : String(error)
+      }
+    }
+  })
+
+  ipcMain.handle('ssh:readDirectory', async (_, connectionId: string, remotePath: string) => {
+    try {
+      const files = await sshManager.readDirectory(connectionId, remotePath)
+      return files
+    } catch (error) {
+      console.error('SSH readDirectory error:', error)
+      throw error
+    }
+  })
+
+  ipcMain.handle(
+    'ssh:readFile',
+    async (event, connectionId: string, remotePath: string, offset: number = 0, limit: number = 1000) => {
+      try {
+        const window = BrowserWindow.fromWebContents(event.sender)
+        if (!window) {
+          throw new Error('Window not found')
+        }
+
+        const content = await sshManager.readFile(
+          connectionId,
+          remotePath,
+          offset,
+          limit,
+          (bytesRead, totalBytes) => {
+            // Отправляем событие прогресса в renderer
+            const progress = totalBytes > 0 ? Math.min(100, Math.round((bytesRead / totalBytes) * 100)) : 0
+            window.webContents.send('ssh:readFile:progress', {
+              connectionId,
+              remotePath,
+              bytesRead,
+              totalBytes,
+              progress
+            })
+          }
+        )
+        return content
+      } catch (error) {
+        console.error('SSH readFile error:', error)
+        throw error
+      }
+    }
+  )
+
+  ipcMain.handle('ssh:getLineCount', async (_, connectionId: string, remotePath: string) => {
+    try {
+      const count = await sshManager.getLineCount(connectionId, remotePath)
+      return count
+    } catch (error) {
+      console.error('SSH getLineCount error:', error)
+      throw error
+    }
+  })
+
+  ipcMain.handle('ssh:getFileStats', async (_, connectionId: string, remotePath: string) => {
+    try {
+      const stats = await sshManager.getFileStats(connectionId, remotePath)
+      return stats
+    } catch (error) {
+      console.error('SSH getFileStats error:', error)
+      throw error
+    }
+  })
+
+  ipcMain.handle('ssh:isConnected', async (_, connectionId: string) => {
+    return sshManager.isConnected(connectionId)
   })
 
   createWindow()
